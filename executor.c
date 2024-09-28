@@ -7,7 +7,6 @@ struct executor tassadar;
 
 /*
  * Prints the state of each completed_jobs queue and the resource utilization records.
- *
  */
 void verify() {
     int i;

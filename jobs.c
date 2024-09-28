@@ -1,4 +1,3 @@
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,13 +35,13 @@ void parse_jobs(char *file_name) {
         cur_job->resources = malloc(num_resources * sizeof(int));
 
         int resource_id;
-				for(i = 0; i < num_resources; i++) {
-				    fscanf(f, "%d ", &resource_id);
-				    cur_job->resources[i] = resource_id;
-				    tassadar.resource_utilization_check[resource_id]++;
-				}
+        for(i = 0; i < num_resources; i++) {
+            fscanf(f, "%d ", &resource_id);
+            cur_job->resources[i] = resource_id;
+            tassadar.resource_utilization_check[resource_id]++;
+        }
 
-				assign_processor(cur_job);
+        assign_processor(cur_job);
 
         /* append new job to head of corresponding list */
         cur_queue = &tassadar.admission_queues[jtype];
@@ -161,24 +160,15 @@ void *admit_jobs(void *arg) {
  *
  * Moves jobs from a single admission queue of the executor.
  * Jobs must acquire the required resource locks before being able to execute.
- *
- * Note: You do not need to spawn any new threads in here to simulate the processors.
- * When a job acquires all its required resources, it will execute do_stuff.
- * When do_stuff is finished, the job is considered to have completed.
- *
- * Once a job has completed, the admission thread must be notified since room
- * just became available in the queue. Be careful to record the job's completion
- * on its assigned processor and keep track of resources utilized.
- *
- * Note: No printf statements are allowed in your final jobs.c code,
- * other than the one from do_stuff!
  */
 void *execute_jobs(void *arg) {
     struct admission_queue *q = arg;
     struct job *job;
-    int i, all_resources_acquired;
+    int i, j;
+    int resource_locks[NUM_RESOURCES] = {0};  // Track which locks we need
 
     while (1) {
+        // Acquire the queue lock
         pthread_mutex_lock(&q->lock);
 
         // Wait until there's an admitted job
@@ -188,50 +178,56 @@ void *execute_jobs(void *arg) {
 
         // Get the job from the front of the queue
         job = q->admitted_jobs[q->head];
+        q->admitted_jobs[q->head] = NULL;
+        q->head = (q->head + 1) % q->capacity;
+        q->num_admitted--;
 
+        // Release the queue lock
         pthread_mutex_unlock(&q->lock);
 
-        // Attempt to acquire all required resources
-        all_resources_acquired = 1;
+        // Mark which resource locks we need
         for (i = 0; i < job->num_resources; i++) {
-            if (pthread_mutex_trylock(&tassadar.resource_locks[job->resources[i]]) != 0) {
-                // Failed to acquire a resource, release all acquired resources
-                all_resources_acquired = 0;
-                int j;
-                for (j = 0; j < i; j++) {
-                    pthread_mutex_unlock(&tassadar.resource_locks[job->resources[j]]);
-                }
-                break;
+            resource_locks[job->resources[i]] = 1;
+        }
+
+        // Acquire resource locks in a fixed order
+        for (i = 0; i < NUM_RESOURCES; i++) {
+            if (resource_locks[i]) {
+                pthread_mutex_lock(&tassadar.resource_locks[i]);
             }
         }
 
-        if (all_resources_acquired) {
-            // Execute the job
-            do_stuff(job);
+        // Acquire the processor record lock
+        pthread_mutex_lock(&tassadar.processor_records[job->processor].lock);
 
-            // Release all resources
-            for (i = 0; i < job->num_resources; i++) {
-                pthread_mutex_unlock(&tassadar.resource_locks[job->resources[i]]);
-                tassadar.resource_utilization_check[job->resources[i]]--;
-            }
+        // Execute the job
+        do_stuff(job);
 
-            // Record job completion
-            pthread_mutex_lock(&tassadar.processor_records[job->processor].lock);
-            job->next = tassadar.processor_records[job->processor].completed_jobs;
-            tassadar.processor_records[job->processor].completed_jobs = job;
-            tassadar.processor_records[job->processor].num_completed++;
-            pthread_mutex_unlock(&tassadar.processor_records[job->processor].lock);
-
-            // Remove job from admission queue
-            pthread_mutex_lock(&q->lock);
-            q->admitted_jobs[q->head] = NULL;
-            q->head = (q->head + 1) % q->capacity;
-            q->num_admitted--;
-
-            // Notify admission thread that space is available
-            pthread_cond_signal(&q->admission_cv);
-            pthread_mutex_unlock(&q->lock);
+        // Update resource utilization
+        for (i = 0; i < job->num_resources; i++) {
+            tassadar.resource_utilization_check[job->resources[i]]--;
         }
+
+        // Record job completion
+        job->next = tassadar.processor_records[job->processor].completed_jobs;
+        tassadar.processor_records[job->processor].completed_jobs = job;
+        tassadar.processor_records[job->processor].num_completed++;
+
+        // Release the processor record lock
+        pthread_mutex_unlock(&tassadar.processor_records[job->processor].lock);
+
+        // Release resource locks in reverse order
+        for (i = NUM_RESOURCES - 1; i >= 0; i--) {
+            if (resource_locks[i]) {
+                pthread_mutex_unlock(&tassadar.resource_locks[i]);
+                resource_locks[i] = 0;  // Reset for next iteration
+            }
+        }
+
+        // Notify admission thread that space is available
+        pthread_mutex_lock(&q->lock);
+        pthread_cond_signal(&q->admission_cv);
+        pthread_mutex_unlock(&q->lock);
     }
 
     return NULL;
